@@ -85,7 +85,8 @@ typedef enum {
     KILL = 5,
     UUID = 6,
     ADDNEIGHBOR = 7,
-    NEIGHBORS = 8
+    NEIGHBORS = 8, 
+    MAP = 9
 } peer_method;
 
 /* Client Info for Connection Thread*/
@@ -137,6 +138,20 @@ ftype file_types [] = {
     {".json", "application/json"},
     {NULL, NULL},
 };
+
+typedef struct point{
+    char* name;
+    int distance;
+} point, *point_t;
+
+typedef struct submap{
+    char* name;
+    point_t* neighbors;
+    int len;
+} submap, *submap_t;
+
+
+
 int rand_close = 0;
 /*Our own custom UDP packet*/
 typedef struct {
@@ -157,6 +172,7 @@ typedef struct peer{
     char* name;
     uint16_t front_port;
     uint16_t back_port;
+    uint16_t syn;
     char* content_dir;
     int distance;
     int num_files;
@@ -164,6 +180,7 @@ typedef struct peer{
     char* host;
     struct sockaddr_in addr;
     uint64_t last_received;
+    submap_t sm;
 } peer, *peer_t;
 
 void printPeer(peer_t self)
@@ -181,7 +198,9 @@ void printPeer(peer_t self)
 
 
 peer_t peer_table[100];
+peer_t non_neighbors[100];
 static int num_peers = 0;
+static int num_nn = 0;
 
 
 
@@ -227,6 +246,17 @@ typedef struct{
 New_flow my_flow[25];
 static int flow_entries = 0;
 
+static int new_names = 0;
+
+char* get_name()
+{
+    printf("gimme dat new name %d\n", new_names);
+    char* name = malloc(sizeof(char)* 20);
+    sprintf(name, "friend_%d", new_names);
+    new_names += 1;
+    return name;
+}
+
 
 static int back_port;
 static int back_fd;
@@ -247,6 +277,13 @@ char* get_rfc_time();
 void re_tx_last(packet* p, New_flow* prev_flow, int fd);
 void re_tx_last_sender(packet* p, New_flow* nf, int fd);
 struct sockaddr_in get_sockaddr_from_host(char* host, uint16_t back_port);
+char* submap_to_json(submap_t sm);
+int send_len(packet* p);
+char* get_uuid_from_name(char* name);
+char* submap_to_json_lsa(submap_t sm);
+peer_t get_peer(uuid_t uuid);
+
+
 
 int getTimeMilliseconds() {
     struct timespec ts;
@@ -270,6 +307,149 @@ int getTimeMilliseconds() {
 void error(char *msg) {
     perror(msg);
     // exit(1);
+}
+
+packet* get_LSA(peer_t peer)
+{
+    packet* p = (packet*)malloc(sizeof(packet));
+    char buf[MAXLINE];
+    char uuid[40];
+    uuid_unparse(peer_table[0]->uuid, uuid);
+    sprintf(buf, "%s&%s", uuid, submap_to_json_lsa(peer_table[0]->sm));
+    p->flags = 0x2;  //0x0011  LSA announcement key
+    p->pack = 0;
+    peer->syn++;
+    p->syn = peer->syn;
+    p->source_port = peer_table[0]->back_port;
+    p->dest_port = peer->back_port;
+    p->length = strlen(buf);
+    p->data = buf;
+    p->window = window_g;
+    return p;
+}
+
+void send_LSA()
+{
+    char* buf;
+    struct sockaddr_in* provider = NULL;
+    unsigned short port;
+    packet* p;
+    for(int i = 1; i < num_peers; i++)
+    {
+        p = get_LSA(peer_table[i]);
+        buf = package(p);
+        provider = &(peer_table[i]->addr);
+        port = peer_table[i]->back_port;
+        if(sendto(back_fd, buf, send_len(p), 0, (struct sockaddr*)provider, sizeof(*provider)) < 0)
+            printf("Error sending LSA packet");
+    }
+
+}
+
+submap_t gen_submap()
+{
+    int index;
+    submap_t sm = malloc(sizeof(submap));
+    sm->name = peer_table[0]->name;
+    sm->neighbors = malloc(sizeof(point_t)*(num_peers-1));
+    for(int i = 1; i < num_peers; i++)
+    {
+        index = i-1;
+        sm->neighbors[index] = malloc(sizeof(point));
+        sm->neighbors[index]->name = peer_table[i]->name;
+        sm->neighbors[index]->distance = peer_table[i]->distance;
+    }
+    sm->len = num_peers-1;
+    return sm;
+}
+
+char* point_to_json_lsa(point_t p)
+{
+    char* buf = malloc(sizeof(char)* BUFSIZE);
+    sprintf(buf, "\"%s\":%d", get_uuid_from_name(p->name), p->distance);
+    return buf;
+}
+
+char* submap_to_json_lsa(submap_t sm)
+{
+    char* buf = malloc(sizeof(char)*BUFSIZE);
+    if(sm->len == 0)
+    {
+        sprintf(buf, "{\"%s\":{}", sm->name);
+        return buf;
+    }
+    sprintf(buf, "\"%s\":{%s", sm->name, point_to_json_lsa(sm->neighbors[0]));
+    for(int i = 1; i < sm->len; i++)
+    {
+        buf = strcat(buf, ",");
+        buf = strcat(buf, point_to_json_lsa(sm->neighbors[i]));
+    }
+    buf = strcat(buf, "}");
+    return buf;
+}
+
+char* point_to_json(point_t p)
+{
+    char* buf = malloc(sizeof(char)* BUFSIZE);
+    sprintf(buf, "\"%s\":%d", p->name, p->distance);
+    return buf;
+}
+
+
+char* submap_to_json(submap_t sm)
+{
+    if(sm == NULL)
+    {
+        printf("Submap is empty");
+        return "";
+    }
+    char* buf = malloc(sizeof(char)*BUFSIZE);
+    if(sm->len == 0)
+    {
+        sprintf(buf, "{\"%s\":{}", sm->name);
+        return buf;
+    }
+    sprintf(buf, "\"%s\":{%s", sm->name, point_to_json(sm->neighbors[0]));
+    for(int i = 1; i < sm->len; i++)
+    {
+        buf = strcat(buf, ",");
+        buf = strcat(buf, point_to_json(sm->neighbors[i]));
+    }
+    buf = strcat(buf, "}");
+    return buf;
+}
+
+submap_t json_to_submap(char* str)
+{
+    submap_t sm = malloc(sizeof(submap));
+    char name[200];
+    char* uuid_str  = malloc(sizeof(char)*40);
+    char rest[BUFSIZE];
+    uuid_t uuid;
+    char* token;
+    int len = 0;
+    int distance = -1;
+    sscanf(str, "\"%[^\"]\":{%[^}]", name, rest);
+    printf("name: %s rest: %s\n", name, rest);
+    sm->name = name;
+    sm->neighbors = malloc(sizeof(point_t)*40);
+
+    token = strtok(rest, ",");
+    while(token != NULL)
+    {
+        sscanf(token, "\"%[^\"]\":%d", uuid_str, &distance);
+        uuid_parse(uuid_str, uuid);
+        sm->neighbors[len] = malloc(sizeof(point));
+        sm->neighbors[len]->name = (get_peer(uuid))->name;
+        sm->neighbors[len]->distance = distance;
+        len++;
+        token = strtok(NULL, ",");
+    }
+    sm->len = len;
+
+    printf("unparsed to this beaut: %s\n", submap_to_json(sm));
+
+    return sm;
 }
 
 void printFlowTable()
@@ -314,8 +494,7 @@ void addNeighbor(uuid_t uuid, char* host, uint16_t frontend, uint16_t backend, i
     np->host = malloc(sizeof(char)*strlen(host));
     sprintf(np->host, "%s", host);
 
-    np->name = malloc(sizeof(char)*8);
-    sprintf(np->name, "peer_%d", (num_peers-1));
+    np->name = get_name();
 
     np->back_port = backend;
     np->front_port = frontend;
@@ -323,6 +502,7 @@ void addNeighbor(uuid_t uuid, char* host, uint16_t frontend, uint16_t backend, i
     np->content_dir = malloc(sizeof(char)*9);
     np->content_dir = "content/";
     np->num_files = 0;
+    np->syn = 0;
     np->last_received = getTimeMilliseconds();
     peer_table[num_peers] = np;
     np->addr = get_sockaddr_from_host(np->host, np->back_port);
@@ -401,6 +581,63 @@ void addFile(char* file, uuid_t uuid)
         }
     }
     printf("No peer with that UUID was found so the file could not be added!\n");
+}
+
+char* get_uuid_from_name(char* name)
+{
+    uuid_t u;
+    char* uuid = malloc(sizeof(char) * 40);
+    bzero(u, sizeof(uuid_t));
+    for(int i = 1; i < num_peers; i++)
+    {
+        if(strcmp(name, peer_table[i]->name) == 0)
+        {
+            uuid_unparse(peer_table[i]->uuid, uuid);
+            return uuid;
+        }
+    }
+    for(int i = 0; i < num_nn; i++)
+    {
+        if(strcmp(name, non_neighbors[i]->name) == 0)
+        {
+            uuid_unparse(non_neighbors[i]->uuid, uuid);
+            return uuid;
+        }
+    }
+    return "";
+}
+
+peer_t get_peer(uuid_t uuid)
+{
+    peer_t np;
+    for(int i = 0; i < num_peers; i++)
+    {
+        if(uuid_compare(uuid, peer_table[i]->uuid) == 0)
+        {
+            printf("found neibr frand\n");
+            return peer_table[i];
+        }
+    }
+    for(int i = 0; i < num_nn; i++)
+    {
+        if(uuid_compare(uuid, non_neighbors[i]->uuid) == 0)
+        {
+            return non_neighbors[i];
+        }
+    }
+    printf("Adding non-neighbor \n");
+    //Not a neighbor and not a known non-neighbor so add to Non-neighbors list
+    np = malloc(sizeof(peer));
+    uuid_copy(np->uuid, uuid);
+    np->name = get_name();
+    np->distance = -1;
+    np->syn = 0;
+    np->sm = NULL;
+
+
+    non_neighbors[num_nn] = np;
+    num_nn++;
+    return np;
 }
 
 //Takes a file name and returns the index of the peer with it in the peer_table
@@ -653,7 +890,6 @@ packet* get_syn_ack(char flowID, uint16_t dest_port, uint16_t ack, char* data)
     clock_t t1 =  t/CLOCKS_PER_SEC;
     v = t1;
     packet* p = (packet*)malloc(sizeof(packet));
-
     p->flags = 0x0c;   //0x1100 Syn, Ack, no Fin
     p->pack = flowID;
     p->source_port = back_port;
@@ -668,7 +904,6 @@ packet* get_syn_ack(char flowID, uint16_t dest_port, uint16_t ack, char* data)
 }
 
 static int rtt_val;
-
 packet* get_ack(packet* p, New_flow* nf)
 {
 
@@ -777,6 +1012,11 @@ url_info parse(char *buf){
             printf("seeing a UUID request\n");
             parse_url.pm = UUID;
         }
+        else if(strcmp(pm, "map") == 0)
+        {
+            printf("seeing a MAP request\n");
+            parse_url.pm = MAP;
+        }
         else if(strcmp(pm, "neighbors") == 0)
         {
             printf("seeing a NEIGHBORS request\n");
@@ -880,6 +1120,7 @@ static void backend(int on_fd)
     char data[MAXLINE];
     struct sockaddr_in sender;
     long size;
+    uuid_t uuid;
     socklen_t sender_len = sizeof(sender);
     packet* p = malloc(sizeof(packet));
     packet* g = malloc(sizeof(packet));
@@ -1243,7 +1484,6 @@ static void backend(int on_fd)
     else if(p->flags == 0x01)
     {
         printf("Somebody's out there!\n");
-        uuid_t uuid;
         uuid_parse(p->data, uuid);
         for(int i = 1; i < num_peers; i++)
         {
@@ -1255,6 +1495,31 @@ static void backend(int on_fd)
             }
         }
     }
+    else if(p->flags == 0x02)
+    {
+        char uuid_str[40];
+        char submap_str[MAXLINE];
+        sscanf(p->data, "%[^&]&%s", uuid_str, submap_str);
+        printf("GOT LSA from %s who's map is %s\n", uuid_str, submap_str);
+        uuid_parse(uuid_str, uuid);
+        if(uuid_compare(uuid, peer_table[0]->uuid) == 0)
+            //This is my own LSA
+            return;
+
+        //find the peer with this id
+        peer_t peer = get_peer(uuid);
+        printf("how: %s\n", peer->name);
+        if(p->syn - peer->syn < 0)
+            //Not a new LSA
+            return;
+
+        peer->sm = json_to_submap(submap_str);
+        //use local name cuz we got it like that
+        peer->sm->name = peer->name;
+
+        printf("How How: %s\n", submap_to_json(peer_table[1]->sm));
+
+    }
     free(p);
     free(g);
 }
@@ -1264,7 +1529,7 @@ void re_tx_last_sender(packet* p, New_flow* nf, int on_fd){
     packet* g = malloc(sizeof(packet));
     char buf[MAXLINE];
     struct sockaddr_in sender;
-    socklen_t sender_len = sizeof(sender);
+    //socklen_t sender_len = sizeof(sender);
     
     //Find specified block of data
     /*unsigned long index = p->ack - nf->base_syn - 1;
@@ -1374,6 +1639,7 @@ void config(char* conf_file)
             np->num_files = 0;
             np->last_received = getTimeMilliseconds();
             np->addr = get_sockaddr_from_host(np->host, np->back_port);
+            np->syn = 0;
             //printPeer(np);
             peer_table[peer_count] = np;
             peer_count++;
@@ -1412,10 +1678,13 @@ void config(char* conf_file)
         printf("Ports not specified!\n");
     }
     //printPeer(self);
+    self->syn = 0;
     self->num_files = 0;
     self->last_received = getTimeMilliseconds();
     peer_table[0] = self;
     num_peers = peer_count;
+    self->sm = gen_submap();
+    printf("SUBMAP: %s\n", submap_to_json_lsa(self->sm));
     return;
 
 }
@@ -1490,9 +1759,9 @@ int main(int argc, char **argv) {
     }
     
     config(conf);
-
     portno = peer_table[0]->front_port;
     back_port = peer_table[0]->back_port;
+
 
     srand(time(NULL)); //Initialize random number generator
 
@@ -1552,6 +1821,8 @@ int main(int argc, char **argv) {
     uint64_t last_timeout_check = getTimeMilliseconds();
     uint64_t last_peering_check = getTimeMilliseconds();
     uint64_t curr_time = getTimeMilliseconds();
+
+    send_LSA();
     while (1) {
         curr_time = getTimeMilliseconds();
         //printf("looping %lu\n", curr_time);
@@ -1560,6 +1831,7 @@ int main(int argc, char **argv) {
                 //Handle PEERing
             printf("PEERING\n");
             sendKeepAlive();
+            send_LSA();
             for(int i = 1; i < num_peers; i++)
             {
                 if((curr_time - peer_table[i]->last_received) > expiration)
@@ -1568,6 +1840,10 @@ int main(int argc, char **argv) {
                     printf("CHUUCH my homie dead: it is %llu and I last heard from him %llu\n", curr_time, peer_table[i]->last_received);
                     remove_peer(peer_table[i]->uuid);
                     i--;
+                    peer_table[0]->sm = gen_submap();
+                    printf("RIP homie: %s\n", submap_to_json_lsa(peer_table[0]->sm));
+                    send_LSA();
+                    //ADVERTISE YOUR NEW MAP HERE
                 }
             }
             last_peering_check = curr_time;
@@ -1576,7 +1852,7 @@ int main(int argc, char **argv) {
         curr_set = live_set;
         // curr_set always overwritten from the beginning???\
         // where do we set FD_SETSIZE?
-        struct timeval tv = {0, 100000};
+        struct timeval tv = {0, 10000};
 
         result = select(FD_SETSIZE, &curr_set, NULL, NULL, &tv);
 
@@ -1709,6 +1985,28 @@ int main(int argc, char **argv) {
             last_timeout_check = getTimeMilliseconds();
         }
     }
+}
+
+char* getMap()
+{
+    char* buf = malloc(sizeof(char) * BUFSIZE);
+    sprintf(buf, "{%s", submap_to_json(peer_table[0]->sm));
+    printf("I am sad\n");
+    for(int i = 1; i < num_peers; i++)
+    {
+        buf = strcat(buf, ",");
+        buf = strcat(buf, submap_to_json(peer_table[i]->sm));
+    }
+    printf("I am so sad\n");
+    for(int j = 0; j < num_nn; j++)
+    {
+        printf("Found a non-neighbor: %s\n", non_neighbors[j]->name);
+        buf = strcat(buf, ",");
+        buf = strcat(buf, submap_to_json(non_neighbors[j]->sm));
+    }
+    printf("I am so so so  sad\n");
+    buf = strcat(buf, "}");
+    return buf;
 }
 
 struct sockaddr_in get_sockaddr_from_host(char* host, uint16_t back_port)
@@ -1867,6 +2165,18 @@ void* serve(int connfd, fd_set* live_set)
             "Connection: Keep-Alive\r\n\r\n", sample->version, strlen(token), get_rfc_time());
             n = write(connfd, buf, strlen(buf));
             n = write(connfd, token, strlen(token));
+            break;
+        case 9:
+            printf("HTTP Server has seen a peer MAP request\n");
+            token = getMap();
+            sprintf(buf, "HTTP/1.%c 200 OK\r\n"
+            "Content-Length: %lu\r\n"
+            "Content-Type: application/json\r\n"
+            "Date: %s\r\n"
+            "Connection: Keep-Alive\r\n\r\n", sample->version, strlen(token), get_rfc_time());
+            n = write(connfd, buf, strlen(buf));
+            n = write(connfd, token, strlen(token));
+            printf("MAP:%s\n", token);
             break;
 
         default:  //
