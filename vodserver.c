@@ -343,7 +343,21 @@ void send_LSA()
         if(sendto(back_fd, buf, send_len(p), 0, (struct sockaddr*)provider, sizeof(*provider)) < 0)
             printf("Error sending LSA packet");
     }
+}
 
+void forward_to_peers(packet* p)
+{
+    struct sockaddr_in* provider = NULL;
+    unsigned short port;
+    char* buf = package(p);
+    for(int i = 1; i < num_peers; i++)
+    {
+        provider = &(peer_table[i]->addr);
+        port = peer_table[i]->back_port;
+        if(sendto(back_fd, buf, send_len(p), 0, (struct sockaddr*)provider, sizeof(*provider)) < 0)
+            printf("Error sending LSA packet");
+    }
+    return;
 }
 
 submap_t gen_submap()
@@ -375,7 +389,7 @@ char* submap_to_json_lsa(submap_t sm)
     char* buf = malloc(sizeof(char)*BUFSIZE);
     if(sm->len == 0)
     {
-        sprintf(buf, "{\"%s\":{}", sm->name);
+        sprintf(buf, "\"%s\":{}", sm->name);
         return buf;
     }
     sprintf(buf, "\"%s\":{%s", sm->name, point_to_json_lsa(sm->neighbors[0]));
@@ -406,7 +420,7 @@ char* submap_to_json(submap_t sm)
     char* buf = malloc(sizeof(char)*BUFSIZE);
     if(sm->len == 0)
     {
-        sprintf(buf, "{\"%s\":{}", sm->name);
+        sprintf(buf, "\"%s\":{}", sm->name);
         return buf;
     }
     sprintf(buf, "\"%s\":{%s", sm->name, point_to_json(sm->neighbors[0]));
@@ -504,6 +518,9 @@ void addNeighbor(uuid_t uuid, char* host, uint16_t frontend, uint16_t backend, i
     np->num_files = 0;
     np->syn = 0;
     np->last_received = getTimeMilliseconds();
+    np->sm = malloc(sizeof(submap));
+    np->sm->name = np->name;
+    np->sm->len = 0;
     peer_table[num_peers] = np;
     np->addr = get_sockaddr_from_host(np->host, np->back_port);
     num_peers++;
@@ -632,7 +649,10 @@ peer_t get_peer(uuid_t uuid)
     np->name = get_name();
     np->distance = -1;
     np->syn = 0;
-    np->sm = NULL;
+    np->sm = malloc(sizeof(submap));
+    np->sm->name = np->name;
+    np->sm->len = 0;
+    np->last_received = getTimeMilliseconds();
 
 
     non_neighbors[num_nn] = np;
@@ -727,6 +747,16 @@ New_flow* flow_look(char flow_ID)
         }
     }
     return NULL;
+}
+
+int remove_nn(int i)
+{
+    num_nn--;
+    while(i < num_nn)
+    {
+        non_neighbors[i] = non_neighbors[i+1];
+    }
+    return 0;
 }
 
 int remove_peer(uuid_t uuid)
@@ -1503,8 +1533,11 @@ static void backend(int on_fd)
         printf("GOT LSA from %s who's map is %s\n", uuid_str, submap_str);
         uuid_parse(uuid_str, uuid);
         if(uuid_compare(uuid, peer_table[0]->uuid) == 0)
+        {
             //This is my own LSA
+            printf("Got My Own LSA\n");
             return;
+        }
 
         //find the peer with this id
         peer_t peer = get_peer(uuid);
@@ -1516,8 +1549,11 @@ static void backend(int on_fd)
         peer->sm = json_to_submap(submap_str);
         //use local name cuz we got it like that
         peer->sm->name = peer->name;
+        peer->last_received = getTimeMilliseconds();
 
         printf("How How: %s\n", submap_to_json(peer_table[1]->sm));
+        forward_to_peers(p);
+        printf("forward_to_peers\n");
 
     }
     free(p);
@@ -1640,6 +1676,9 @@ void config(char* conf_file)
             np->last_received = getTimeMilliseconds();
             np->addr = get_sockaddr_from_host(np->host, np->back_port);
             np->syn = 0;
+            np->sm = malloc(sizeof(submap));
+            np->sm->name = np->name;
+            np->sm->len = 0;
             //printPeer(np);
             peer_table[peer_count] = np;
             peer_count++;
@@ -1843,7 +1882,17 @@ int main(int argc, char **argv) {
                     peer_table[0]->sm = gen_submap();
                     printf("RIP homie: %s\n", submap_to_json_lsa(peer_table[0]->sm));
                     send_LSA();
-                    //ADVERTISE YOUR NEW MAP HERE
+                }
+            }
+            for(int i = 0; i < num_nn; i++)
+            {
+                if((curr_time - non_neighbors[i]->last_received) > expiration*3)
+                {
+
+                    printf("CHUUCH my homie dead: it is %llu and I last heard from him %llu\n", curr_time, non_neighbors[i]->last_received);
+                    remove_nn(i);
+                    i--;
+                    printf("RIP homie: %s\n", submap_to_json_lsa(peer_table[0]->sm));
                 }
             }
             last_peering_check = curr_time;
